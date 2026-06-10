@@ -45,7 +45,7 @@ dies at import time:
 ```
 ImportError while importing test module '/app/tests/test_models.py'.
 ...
-src/ledger/models.py:17: in <module>
+src/ledger/models.py:16: in <module>
     from pydantic import BaseModel, ConfigDict, Field, field_validator
 E   ImportError: cannot import name 'field_validator' from 'pydantic'
 ```
