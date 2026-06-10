@@ -6,8 +6,12 @@ and you have to get `pytest` green inside the container.
 
 There is a branch, `broken-deps`, that ships a deliberately broken
 `pyproject.toml`. Below is how I reproduced the failure, diagnosed it from the
-traceback, and fixed it. Two independent breaks are walked through — each is a
-realistic flavor of the same class of problem.
+traceback, and fixed it.
+
+> Every command output quoted below was captured from an actual run on this
+> machine (macOS, Python 3.11 host; the container runs Python 3.12.4). Nothing
+> here is illustrative-only; where a second scenario behaves differently from
+> what you might expect, that's called out explicitly.
 
 > TL;DR of the lesson: read the traceback bottom-up, identify which package the
 > failing symbol belongs to, then reconcile that package's version with the code
@@ -27,7 +31,7 @@ docker run --rm ledger-sandbox:broken    # red
 
 ---
 
-## Break #1 — Pydantic pinned to v1, code is written for v2
+## The break on `broken-deps` — Pydantic pinned to v1, code is written for v2
 
 ### The broken pin
 
@@ -37,18 +41,26 @@ docker run --rm ledger-sandbox:broken    # red
     "pydantic==1.10.13",
 ```
 
+and drops the `pydantic-core` pin (pydantic-core is a v2-only package).
+
+This combination *installs cleanly*. FastAPI 0.111 declares
+`pydantic>=1.7.4,<3.0.0` (verified below), so pip is happy to resolve Pydantic
+v1 alongside it. The failure surfaces only when our code imports a v2 symbol.
+
 ### The symptom
 
-The suite never even collects. `docker build` may succeed, but the test run
-dies at import time:
+The suite never even collects. The test run dies at import time:
 
 ```
 ImportError while importing test module '/app/tests/test_models.py'.
 ...
-src/ledger/models.py:17: in <module>
+src/ledger/models.py:16: in <module>
     from pydantic import BaseModel, ConfigDict, Field, field_validator
 E   ImportError: cannot import name 'field_validator' from 'pydantic'
 ```
+
+pytest reports `3 errors during collection` (one per test module, since all
+three import the library).
 
 ### Diagnosis
 
@@ -79,87 +91,69 @@ Rebuild and rerun:
 
 ```bash
 docker build -t ledger-sandbox .
-docker run --rm ledger-sandbox     # green
+docker run --rm ledger-sandbox     # green: 15 passed
 ```
 
 ### Why not "just fix the code for v1"?
 
-You could rewrite the models for v1, but that's the wrong direction: FastAPI
-0.111 itself requires Pydantic v2. Downgrading Pydantic to satisfy one module
-would break the framework. The cheapest correct move is to align the pin with
-what the rest of the stack already needs.
+You could rewrite the models for v1, but that's the wrong direction. The rest of
+the codebase (and the FastAPI request/response models) is written against the v2
+API, so the cheapest correct move is to align the pin with what the code already
+uses rather than rewriting working code to satisfy a downgraded dependency.
+
+Note: FastAPI 0.111 does **not** force this for you — it accepts Pydantic v1 or
+v2. Verified requirement:
+
+```bash
+python -c "import importlib.metadata as m; print([r for r in m.requires('fastapi') if 'pydantic' in r or 'starlette' in r])"
+# ['starlette<0.38.0,>=0.37.2',
+#  'pydantic!=1.8,!=1.8.1,!=2.0.0,!=2.0.1,!=2.1.0,<3.0.0,>=1.7.4', ...]
+```
+
+That `>=1.7.4` is exactly why the broken pin installed without complaint and
+failed later, at import — the more interesting failure mode to practice.
 
 ---
 
-## Break #2 — FastAPI / Starlette / httpx skew
+## A second scenario worth knowing: peer-version skew (install-time conflict)
 
-This is the subtler, more interview-realistic version: everything *installs*,
-but the API tests explode because the web stack is internally inconsistent.
+The pinned set in `pyproject.toml` (`fastapi==0.111.0`, `starlette==0.37.2`,
+`httpx==0.27.0`) is a mutually compatible triple. A natural question is "what
+happens if I bump just one of them?" I tried it so the answer here is measured,
+not guessed.
 
-### The broken pins
-
-```toml
-    "fastapi==0.111.0",
-    "starlette==0.41.0",   # too new for fastapi 0.111
-    "httpx==0.23.0",       # too old for this Starlette TestClient
-```
-
-### The symptom
-
-`test_models.py` and `test_core.py` pass, but every test in `test_api.py` fails
-at the moment the `TestClient` is constructed:
-
-```
-tests/test_api.py:1: in <module>
-    from fastapi.testclient import TestClient
-...
-TypeError: Client.__init__() got an unexpected keyword argument 'app'
-```
-
-or, depending on the exact skew:
-
-```
-RuntimeError: Starlette 0.41 is not compatible with this version of FastAPI
-```
-
-### Diagnosis
-
-The failure is isolated to the API tests, which is the clue: the pure-Python
-library tests don't touch the web stack. `TestClient` is a thin wrapper that
-Starlette builds on top of **httpx**. Two things have to be true:
-
-1. `fastapi==0.111.0` declares a supported `starlette` range
-   (`>=0.37.2,<0.38.0`). `0.41.0` is outside it.
-2. Starlette's `TestClient` passes `app=...` into `httpx.Client`, which only
-   gained that transport wiring in httpx 0.24+. `httpx==0.23.0` predates it,
-   hence the `unexpected keyword argument 'app'`.
-
-Inspect the resolved versions and FastAPI's own requirement:
+I attempted to install an inconsistent set in a throwaway venv:
 
 ```bash
-docker run --rm ledger-sandbox:broken pip show fastapi | grep -i requires
-docker run --rm ledger-sandbox:broken pip index versions starlette
+pip install "fastapi==0.111.0" "starlette==0.41.0" "httpx==0.23.0"
 ```
 
-### Fix
+With a modern pip resolver this does **not** get far enough to produce a runtime
+traceback — it fails at dependency resolution. Actual captured output:
 
-Pin all three to a mutually compatible set — the one FastAPI 0.111 was released
-against:
+```
+ERROR: Cannot install fastapi==0.111.0 and starlette==0.41.0 because these
+package versions have conflicting dependencies.
 
-```toml
-    "fastapi==0.111.0",
-    "starlette==0.37.2",
-    "httpx==0.27.0",
+The conflict is caused by:
+    The user requested starlette==0.41.0
+    fastapi 0.111.0 depends on starlette<0.38.0 and >=0.37.2
+
+ERROR: ResolutionImpossible
 ```
 
-Rebuild, rerun, green.
+### Why this matters for the diagnosis
 
-### The general rule
+This is the *good* failure mode: the resolver catches the skew before anything
+runs. The lesson is the inverse of the Pydantic case — there, a too-loose
+upstream constraint (`pydantic>=1.7.4`) let an incompatible version through to
+fail at import; here, FastAPI's tight `starlette<0.38.0` constraint stops the
+bad combination at install time.
 
-When a single framework (FastAPI) sits on top of peers (Starlette) and a client
-(httpx), pin to a **known-good triple** rather than chasing each latest release.
-`pip install fastapi==0.111.0` on its own resolves a compatible Starlette; the
-trap is overriding one leg of the triple with a "newer is better" pin.
+The general rule that covers both: when a framework (FastAPI) sits on top of a
+peer (Starlette) and a client (httpx), pin to a **known-good set** and let the
+framework's own constraints validate it, rather than overriding one leg with a
+"newer is better" pin.
 
 ---
 
@@ -172,10 +166,12 @@ trap is overriding one leg of the triple with a "newer is better" pin.
 3. **Separate collection errors from assertion failures.** An `ImportError`
    during collection is almost always a dependency/version problem, not a logic
    bug.
-4. **Ask "which package owns this symbol, and what version introduced/removed
+4. **Separate install-time conflicts from runtime errors.** A
+   `ResolutionImpossible` means pip caught the skew up front; an `ImportError`
+   or `TypeError` at runtime means a too-loose constraint let a bad version
+   through.
+5. **Ask "which package owns this symbol, and what version introduced/removed
    it?"** (`pip show <pkg>`, `pip index versions <pkg>`).
-5. **Reconcile peers as a set**, not one pin at a time, when a framework spans
-   multiple packages.
 6. **Rebuild from clean** to make sure the fix is the image, not your shell:
    `docker build --no-cache`.
 7. **Confirm green inside the container** and capture the output.
