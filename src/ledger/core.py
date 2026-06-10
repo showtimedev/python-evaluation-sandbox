@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from decimal import Decimal
 from datetime import date
-from typing import Iterable
+from typing import Iterable, Iterator
 
 from ledger.models import Category, Transaction
 
@@ -31,7 +31,7 @@ class Ledger:
     def __len__(self) -> int:
         return len(self._by_id)
 
-    def __iter__(self):
+    def __iter__(self) -> "Iterator[Transaction]":
         return iter(self._by_id.values())
 
     @property
